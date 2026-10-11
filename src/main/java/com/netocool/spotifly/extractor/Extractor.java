@@ -8,6 +8,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -17,6 +18,7 @@ import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.schabi.newpipe.extractor.InfoItem;
+import org.schabi.newpipe.extractor.MediaFormat;
 import org.schabi.newpipe.extractor.NewPipe;
 import org.schabi.newpipe.extractor.ServiceList;
 import org.schabi.newpipe.extractor.StreamingService;
@@ -28,6 +30,7 @@ import org.schabi.newpipe.extractor.services.youtube.linkHandler.YoutubeSearchQu
 import org.schabi.newpipe.extractor.stream.AudioStream;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
 import org.schabi.newpipe.extractor.stream.StreamInfoItem;
+import org.schabi.newpipe.extractor.stream.VideoStream;
 
 /**
  * Songs from YouTube on Android, where yt-dlp cannot run: the searches, the
@@ -194,6 +197,175 @@ public final class Extractor {
         if (got == 0 || !part.renameTo(new File(path))) {
             part.delete();
             throw new IOException("the download of " + url + " did not complete");
+        }
+    }
+
+    /** Where a video's clip starts, as a share of it: past the intro. */
+    private static final double CLIP_AT = 0.35;
+    /** The picture height looked for: still sharp once cropped to a tall phone. */
+    private static final int CLIP_HEIGHT = 720;
+
+    /**
+     * Saves about {@code seconds} of the video's picture, without sound,
+     * from a third of the way in, at {@code path}: the loop shown behind
+     * a song, as Spotify's Canvas. Only those pieces are fetched, and the
+     * file is a fragmented MP4 whose first frame is at time zero. It is
+     * written beside {@code path} first and moved in place once complete.
+     * Optional in a module: the app asks the APK's copy when it is absent.
+     */
+    public static void video(String url, String path, int seconds) throws Exception {
+        StreamInfo info = READ.remove(url);
+        if (info == null) {
+            info = StreamInfo.getInfo(service(), url);
+        }
+        VideoStream video = smallMp4(info);
+        if (video == null || video.getIndexEnd() <= video.getIndexStart()) {
+            throw new IOException("no MP4 picture for " + url);
+        }
+        String link = video.getContent();
+        byte[] head = piece(link + "&range=0-" + video.getIndexEnd() + "&rn=0");
+        if (head.length <= video.getIndexEnd()) {
+            throw new IOException("a short index for " + url);
+        }
+
+        // The index (sidx): each piece's size and length, in order.
+        ByteBuffer index = ByteBuffer.wrap(head, video.getIndexStart(),
+                video.getIndexEnd() + 1 - video.getIndexStart());
+        index.getInt();
+        if (index.getInt() != box("sidx")) {
+            throw new IOException("no index for " + url);
+        }
+        int version = index.get() & 0xff;
+        index.position(index.position() + 3 + 4);
+        long timescale = index.getInt() & 0xffffffffL;
+        long firstOffset;
+        if (version == 0) {
+            index.getInt();
+            firstOffset = index.getInt() & 0xffffffffL;
+        } else {
+            index.getLong();
+            firstOffset = index.getLong();
+        }
+        index.getShort();
+        int count = index.getShort() & 0xffff;
+        long[] starts = new long[count];
+        long[] sizes = new long[count];
+        double[] times = new double[count + 1];
+        long at = video.getIndexEnd() + 1L + firstOffset;
+        for (int i = 0; i < count; i++) {
+            sizes[i] = index.getInt() & 0x7fffffffL;
+            long duration = index.getInt() & 0xffffffffL;
+            index.getInt();
+            starts[i] = at;
+            at += sizes[i];
+            times[i + 1] = times[i] + (double) duration / Math.max(1, timescale);
+        }
+        if (count == 0) {
+            throw new IOException("an empty index for " + url);
+        }
+        int first = 0;
+        while (first + 1 < count && times[first] < times[count] * CLIP_AT) {
+            first++;
+        }
+        int last = first;
+        while (last + 1 < count && times[last + 1] - times[first] < seconds) {
+            last++;
+        }
+
+        File part = new File(path + ".part");
+        try (OutputStream out = new FileOutputStream(part)) {
+            out.write(head, video.getInitStart(), video.getInitEnd() + 1 - video.getInitStart());
+            long from = starts[first];
+            long end = starts[last] + sizes[last] - 1;
+            ByteArrayOutputStream pieces = new ByteArrayOutputStream();
+            int request = 1;
+            while (from <= end) {
+                long to = Math.min(end, from + PIECE - 1);
+                byte[] got = piece(link + "&range=" + from + "-" + to + "&rn=" + (request++));
+                if (got.length == 0) {
+                    throw new IOException("the clip of " + url + " stopped");
+                }
+                pieces.write(got);
+                from += got.length;
+            }
+            byte[] clip = pieces.toByteArray();
+            startAtZero(clip);
+            out.write(clip);
+        }
+        if (!part.renameTo(new File(path))) {
+            part.delete();
+            throw new IOException("the clip of " + url + " did not complete");
+        }
+    }
+
+    /** The MP4 picture nearest {@link #CLIP_HEIGHT}, in H.264 every phone decodes. */
+    private static VideoStream smallMp4(StreamInfo info) {
+        VideoStream best = null;
+        for (VideoStream v : info.getVideoOnlyStreams()) {
+            if (v.getFormat() != MediaFormat.MPEG_4 || v.getCodec() == null
+                    || !v.getCodec().startsWith("avc1") || v.getHeight() <= 0
+                    || v.getHeight() > 720) {
+                continue;
+            }
+            if (best == null || Math.abs(v.getHeight() - CLIP_HEIGHT)
+                    < Math.abs(best.getHeight() - CLIP_HEIGHT)) {
+                best = v;
+            }
+        }
+        return best;
+    }
+
+    /** A box type, as the four letters read as one big-endian number. */
+    private static int box(String type) {
+        byte[] b = type.getBytes(StandardCharsets.US_ASCII);
+        return (b[0] & 0xff) << 24 | (b[1] & 0xff) << 16 | (b[2] & 0xff) << 8 | (b[3] & 0xff);
+    }
+
+    /**
+     * Moves the clip's pieces back in time so its first frame is at zero:
+     * each fragment's decode time (moof, traf, tfdt) less the first one's.
+     */
+    private static void startAtZero(byte[] clip) {
+        ByteBuffer all = ByteBuffer.wrap(clip);
+        long base = -1;
+        for (int moof = 0; moof + 8 <= clip.length; ) {
+            int size = all.getInt(moof);
+            if (size < 8) {
+                return;
+            }
+            if (all.getInt(moof + 4) == box("moof")) {
+                for (int traf = moof + 8; traf + 8 <= moof + size; ) {
+                    int trafSize = all.getInt(traf);
+                    if (trafSize < 8) {
+                        break;
+                    }
+                    if (all.getInt(traf + 4) == box("traf")) {
+                        for (int tfdt = traf + 8; tfdt + 8 <= traf + trafSize; ) {
+                            int tfdtSize = all.getInt(tfdt);
+                            if (tfdtSize < 8) {
+                                break;
+                            }
+                            if (all.getInt(tfdt + 4) == box("tfdt")) {
+                                boolean wide = clip[tfdt + 8] == 1;
+                                long time = wide
+                                        ? all.getLong(tfdt + 12)
+                                        : all.getInt(tfdt + 12) & 0xffffffffL;
+                                if (base < 0) {
+                                    base = time;
+                                }
+                                if (wide) {
+                                    all.putLong(tfdt + 12, time - base);
+                                } else {
+                                    all.putInt(tfdt + 12, (int) (time - base));
+                                }
+                            }
+                            tfdt += tfdtSize;
+                        }
+                    }
+                    traf += trafSize;
+                }
+            }
+            moof += size;
         }
     }
 

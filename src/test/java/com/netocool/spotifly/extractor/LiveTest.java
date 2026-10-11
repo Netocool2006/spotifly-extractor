@@ -28,6 +28,30 @@ public class LiveTest {
         }
     }
 
+    @Test
+    public void savesAShortClipOfAVideo() throws Exception {
+        try {
+            JSONArray videos = new JSONArray(Extractor.search("Queen Bohemian Rhapsody official video", false, 3));
+            assertTrue("YouTube found no videos", videos.length() > 0);
+            File clip = File.createTempFile("clip", ".mp4");
+            clip.delete();
+            try {
+                Extractor.video(videos.getJSONObject(0).getString("url"), clip.getPath(), 10);
+                assertTrue("the clip is too small: " + clip.length(), clip.length() > 100_000);
+                assertTrue("the clip is too big: " + clip.length(), clip.length() < 8_000_000);
+                byte[] start = new byte[8];
+                try (java.io.FileInputStream in = new java.io.FileInputStream(clip)) {
+                    assertTrue(in.read(start) == 8);
+                }
+                assertTrue("not an MP4", new String(start, 4, 4, "US-ASCII").equals("ftyp"));
+            } finally {
+                clip.delete();
+            }
+        } catch (SignInConfirmNotBotException blocked) {
+            assumeNoException("YouTube blocked this machine as a bot", blocked);
+        }
+    }
+
     private void liveCheck() throws Exception {
         JSONArray songs = new JSONArray(Extractor.search("Queen Bohemian Rhapsody", true, 3));
         assertTrue("YouTube Music found no songs", songs.length() > 0);
