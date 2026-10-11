@@ -1,0 +1,5 @@
+// The extractor module alone: what the Spotifly app downloads.
+dependencyResolutionManagement {
+    repositories { mavenCentral(); maven { url 'https://jitpack.io' } }
+}
+rootProject.name = 'spotifly-extractor'

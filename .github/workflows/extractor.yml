@@ -1,0 +1,94 @@
+name: Extractor module
+
+# Spotifly's YouTube extractor (NewPipe Extractor and Extractor.java), built
+# as a signed module the app downloads, so a YouTube change is answered
+# without a new APK. It is rebuilt when NewPipe
+# releases, when the module's code changes on main, or by hand. Each module
+# must pass a live search, read and download against YouTube first.
+on:
+  schedule:
+    - cron: '41 7 * * *'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even when NewPipe has not released
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extractor
+  cancel-in-progress: false
+
+jobs:
+  module:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: NewPipe's newest release and the published module's
+        id: versions
+        run: |
+          newpipe=$(gh api repos/TeamNewPipe/NewPipeExtractor/releases/latest --jq .tag_name)
+          published=$(gh release download extractor --pattern manifest.json --output - 2>/dev/null | jq -r .newpipe || true)
+          echo "newpipe=$newpipe" >> "$GITHUB_OUTPUT"
+          if [ "$newpipe" != "$published" ] || [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.force }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Building a module with NewPipe $newpipe (published: ${published:-none})"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "The published module already has NewPipe $newpipe"
+          fi
+
+      - uses: actions/setup-java@v5
+        if: steps.versions.outputs.build == 'true'
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.versions.outputs.build == 'true'
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Live check against YouTube
+        if: steps.versions.outputs.build == 'true'
+        run: >
+          gradle test extractorDex
+          -PliveYouTube
+          -PnewpipeVersion=${{ steps.versions.outputs.newpipe }}
+          -PextractorBuild=${{ github.run_number }}
+
+      - name: Sign
+        if: steps.versions.outputs.build == 'true'
+        env:
+          SIGNING_KEY: ${{ secrets.EXTRACTOR_SIGNING_KEY }}
+        run: |
+          cd build/module
+          umask 077
+          printf '%s\n' "$SIGNING_KEY" > key.pem
+          openssl dgst -sha256 -sign key.pem -out extractor.jar.sig extractor.jar
+          rm key.pem
+          jq -n \
+            --argjson build ${{ github.run_number }} \
+            --arg newpipe "${{ steps.versions.outputs.newpipe }}" \
+            --arg sha256 "$(sha256sum extractor.jar | cut -d' ' -f1)" \
+            '{build: $build, newpipe: $newpipe, file: "extractor.jar", sha256: $sha256}' > manifest.json
+          cat manifest.json
+
+      - name: Publish
+        if: steps.versions.outputs.build == 'true'
+        run: |
+          cd build/module
+          gh release view extractor >/dev/null 2>&1 || gh release create extractor \
+            --title "Extractor module" --latest=false \
+            --notes "The Android app's YouTube extractor, downloaded and verified by the app itself. Not an app release."
+          # The jar and its signature first: the manifest names them.
+          gh release upload extractor extractor.jar extractor.jar.sig --clobber
+          gh release upload extractor manifest.json --clobber

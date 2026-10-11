@@ -1,0 +1,69 @@
+// The extractor module: NewPipe Extractor and the code Spotifly calls it
+// through (Extractor.java). The APK carries it as its fallback; the
+// workflow (.github/workflows/extractor.yml) also dexes it into a module
+// the app downloads when NewPipe releases.
+plugins { id 'java-library' }
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+def newPipeVersion = providers.gradleProperty('newpipeVersion').getOrElse('v0.26.5')
+def moduleBuild = providers.gradleProperty('extractorBuild').getOrElse('0')
+
+dependencies {
+    api "com.github.TeamNewPipe:NewPipeExtractor:${newPipeVersion}"
+    // Android's org.json, for the plain JVM the tests run on.
+    compileOnly 'org.json:json:20240303'
+    testImplementation 'org.json:json:20240303'
+    testImplementation 'junit:junit:4.13.2'
+}
+
+// The build number and NewPipe release, compiled in.
+def generated = layout.buildDirectory.dir('generated/buildinfo')
+def buildInfo = tasks.register('buildInfo') {
+    inputs.property('build', moduleBuild)
+    inputs.property('newpipe', newPipeVersion)
+    outputs.dir(generated)
+    doLast {
+        def file = generated.get().file('com/netocool/spotifly/extractor/BuildInfo.java').asFile
+        file.parentFile.mkdirs()
+        file.text = """package com.netocool.spotifly.extractor;
+
+/** Written by the build (extractor/build.gradle). */
+final class BuildInfo {
+    static final int BUILD = ${Integer.parseInt(moduleBuild)};
+    static final String NEWPIPE = "${newPipeVersion}";
+
+    private BuildInfo() {}
+}
+"""
+    }
+}
+sourceSets.main.java.srcDir(buildInfo)
+
+// The live check the workflow runs before it publishes: a real search,
+// details and download against YouTube. Skipped unless asked for.
+tasks.named('test') {
+    onlyIf { providers.gradleProperty('liveYouTube').isPresent() }
+}
+
+// The module as Android loads it: every class it needs, in one dex jar.
+tasks.register('extractorDex', Exec) {
+    dependsOn tasks.named('jar')
+    def out = layout.buildDirectory.file('module/extractor.jar')
+    inputs.files(tasks.named('jar'), configurations.runtimeClasspath)
+    outputs.file(out)
+    doFirst {
+        def sdk = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+        def tools = new File(sdk, 'build-tools').listFiles().findAll { it.isDirectory() }.sort { it.name }.last()
+        def d8 = new File(tools, System.getProperty('os.name').toLowerCase().contains('windows') ? 'd8.bat' : 'd8')
+        def android = new File(sdk, 'platforms').listFiles().findAll { it.name.startsWith('android-') }.sort { it.name }.last()
+        out.get().asFile.parentFile.mkdirs()
+        def inputs = [tasks.jar.archiveFile.get().asFile] + configurations.runtimeClasspath.files
+        commandLine([d8.path, '--release', '--min-api', '26',
+                     '--lib', new File(android, 'android.jar').path,
+                     '--output', out.get().asFile.path] + inputs*.path)
+    }
+}
